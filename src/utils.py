@@ -403,3 +403,79 @@ def train_xgboost(X_train, y_train, X_test, y_test):
     model.fit(X_train, y_train, sample_weight=sample_weights,
               eval_set=[(X_test, y_test)], verbose=False)
     return model
+
+def plot_confusion_matrix(targets, preds, title='Confusion Matrix', cmap='Blues', ax=None):
+    """Plot confusion matrix using seaborn heatmap."""
+    if ax is None:
+        ax = plt.gca()
+    cm = confusion_matrix(targets, preds)
+    sns.heatmap(cm, annot=True, fmt='d', cmap=cmap, ax=ax)
+    ax.set_title(title)
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Actual')
+    return ax
+
+def plot_loss_f1(train_losses, val_losses, val_f1s, xgb_baseline=None, axs=None):
+    if axs is None:
+        fig, axs = plt.subplots(1, 2, figsize=(14,5))
+    axs[0].plot(train_losses, label='Train Loss')
+    axs[0].plot(val_losses, label='Validation Loss')
+    axs[0].set_xlabel('Epoch')
+    axs[0].set_ylabel('Loss')
+    axs[0].legend()
+    axs[0].grid(True)
+    axs[0].set_title('Loss Curves')
+    axs[1].plot(val_f1s, label='Validation Macro F1', color='green')
+    if xgb_baseline is not None:
+        axs[1].axhline(y=xgb_baseline, color='red', linestyle='--', label='XGBoost F1')
+    axs[1].set_xlabel('Epoch')
+    axs[1].set_ylabel('Macro F1')
+    axs[1].legend()
+    axs[1].grid(True)
+    axs[1].set_title('Validation Macro F1')
+    return axs
+
+# ---------- Inference helpers ----------
+def load_inference_components(model_path='models/best_pytorch_model.pth',
+                              scaler_path='models/transformers/robust_scaler.pkl',
+                              cat_encoder_path='models/transformers/cat_encoders.pkl'):
+    """Load the saved model, RobustScaler, and categorical mappings."""
+    import pickle
+    # We need the model architecture. We can infer cardinalities from the saved model or hardcode.
+    # For simplicity, we'll hardcode the cardinalities (4,2,5) as they are fixed.
+    model = EmbeddingNet(num_numeric=7, cat_cardinalities=[4,2,5])
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+    model.eval()
+    with open(scaler_path, 'rb') as f:
+        scaler = pickle.load(f)
+    with open(cat_encoder_path, 'rb') as f:
+        cat_mappings = pickle.load(f)
+    return model, scaler, cat_mappings
+
+def preprocess_single_sample(input_dict, num_cols, cat_cols, scaler, cat_mappings):
+    """
+    Preprocess a single sample from user input.
+    - input_dict: dict with keys from num_cols and cat_cols (strings)
+    - Returns: X_num_scaled (1, len(num_cols)), X_cat_encoded (1, len(cat_cols))
+    """
+    # Numeric features
+    X_num = np.array([[float(input_dict[col]) for col in num_cols]], dtype=np.float32)
+    X_num_scaled = scaler.transform(X_num)
+    # Categorical features
+    X_cat = np.zeros((1, len(cat_cols)), dtype=np.int64)
+    for i, col in enumerate(cat_cols):
+        mapping = cat_mappings[col]
+        val = input_dict[col]
+        # If value not in mapping, default to 0 (the first category)
+        X_cat[0, i] = mapping.get(val, 0)
+    return X_num_scaled, X_cat
+
+def predict_single(model, X_num, X_cat, device='cpu'):
+    """Run inference and return predicted class and probabilities."""
+    with torch.no_grad():
+        X_num = torch.tensor(X_num, dtype=torch.float32).to(device)
+        X_cat = torch.tensor(X_cat, dtype=torch.long).to(device)
+        outputs = model(X_num, X_cat)
+        probs = torch.softmax(outputs, dim=1).cpu().numpy().flatten()
+        pred_class = np.argmax(probs)
+    return pred_class, probs

@@ -9,7 +9,7 @@ End‑to‑end ML pipeline to classify BNPL customers into Low/Medium/High defau
 
 ## Project Structure
 - `src/` – Python modules (data preparation, training, inference)
-- `notebooks/` – Jupyter notebooks with detailed EDA and model building
+- `notebooks/` – detailed and visual EDA, model building/comparison, interactive predictions
 - `models/` – saved model weights and transformers
 - `data/` – raw and processed data
 
