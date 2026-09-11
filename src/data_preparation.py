@@ -234,4 +234,4 @@ print("Transformers saved to: models/transformers/")
 print("  - robust_scaler.pkl")
 print("  - cat_encoders.pkl")
 
-print("\n✅ Data preparation complete. All files are ready.")
+print("\nData preparation complete. All files are ready.")

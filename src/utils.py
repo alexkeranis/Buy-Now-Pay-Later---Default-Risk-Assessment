@@ -452,30 +452,75 @@ def load_inference_components(model_path='models/best_pytorch_model.pth',
         cat_mappings = pickle.load(f)
     return model, scaler, cat_mappings
 
+def process_single_input(input_dict):
+    """Process a single dictionary of inputs.
+
+    Adds the engineered Debt_to_Income_Ratio, validates numeric ranges
+    (only for the raw columns), and runs the full preprocessing + prediction
+    pipeline matching training.
+    """
+    # Work on a copy so we don't mutate the caller's dict
+    input_dict = dict(input_dict)
+
+    # --- Engineered feature (must match training formula) ---
+    income = float(input_dict['Income_USD'])
+    debt = float(input_dict['Total_BNPL_Debt_USD'])
+    input_dict['Debt_to_Income_Ratio'] = debt / income if income != 0 else 0.0
+
+    # --- Range validation (raw numeric columns only) ---
+    for col in num_cols:
+        low, high = ranges[col]
+        val = input_dict[col]
+        if val < low or val > high:
+            print(f"Warning: {col} = {val} is outside typical range [{low}, {high}]")
+
+    # --- Guard against column-order drift ---
+    if hasattr(scaler, "feature_names_in_"):
+        expected = list(scaler.feature_names_in_)
+        if expected != num_cols_with_ratio:
+            raise ValueError(
+                f"Column mismatch between scaler and inference script:\n"
+                f"  scaler fit on : {expected}\n"
+                f"  script passing: {num_cols_with_ratio}"
+            )
+
+    X_num, X_cat = preprocess_single_sample(
+        input_dict, num_cols_with_ratio, cat_cols, scaler, cat_mappings
+    )
+    pred_class, probs = predict_single(model, X_num, X_cat, device)
+    return pred_class, probs
+
 def preprocess_single_sample(input_dict, num_cols, cat_cols, scaler, cat_mappings):
     """
     Preprocess a single sample from user input.
-    - input_dict: dict with keys from num_cols and cat_cols (strings)
-    - Returns: X_num_scaled (1, len(num_cols)), X_cat_encoded (1, len(cat_cols))
+    - input_dict : dict with keys from num_cols and cat_cols
+    - num_cols   : numeric columns the scaler was fit on (in that order)
+    - Returns    : X_num_scaled (1, len(num_cols)), X_cat_encoded (1, len(cat_cols))
     """
-    # Numeric features
-    X_num = np.array([[float(input_dict[col]) for col in num_cols]], dtype=np.float32)
-    X_num_scaled = scaler.transform(X_num)
+    # Numeric features — wrapped in a DataFrame so sklearn keeps feature names
+    X_num_df = pd.DataFrame(
+        [[float(input_dict[col]) for col in num_cols]],
+        columns=num_cols,
+    )
+    X_num_scaled = scaler.transform(X_num_df)
+
     # Categorical features
     X_cat = np.zeros((1, len(cat_cols)), dtype=np.int64)
     for i, col in enumerate(cat_cols):
         mapping = cat_mappings[col]
         val = input_dict[col]
-        # If value not in mapping, default to 0 (the first category)
+        # Unknown category → 0 (first category)
         X_cat[0, i] = mapping.get(val, 0)
     return X_num_scaled, X_cat
 
+
 def predict_single(model, X_num, X_cat, device='cpu'):
-    """Run inference and return predicted class and probabilities."""
+    """Run inference on one sample; return (predicted_class, probabilities)."""
+    model.eval()
     with torch.no_grad():
-        X_num = torch.tensor(X_num, dtype=torch.float32).to(device)
-        X_cat = torch.tensor(X_cat, dtype=torch.long).to(device)
-        outputs = model(X_num, X_cat)
+        X_num_t = torch.tensor(X_num, dtype=torch.float32).to(device)
+        X_cat_t = torch.tensor(X_cat, dtype=torch.long).to(device)
+        outputs = model(X_num_t, X_cat_t)
         probs = torch.softmax(outputs, dim=1).cpu().numpy().flatten()
-        pred_class = np.argmax(probs)
+        pred_class = int(np.argmax(probs))
     return pred_class, probs

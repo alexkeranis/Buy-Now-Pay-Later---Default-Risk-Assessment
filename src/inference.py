@@ -32,6 +32,10 @@ num_cols = ['Age', 'Total_BNPL_Active_Loans', 'Total_BNPL_Debt_USD',
             'Average_Transaction_Value_USD', 'Income_USD', 'Credit_Score']
 cat_cols = ['Employment_Status', 'Late_Payment_History', 'Shopping_Category_Most_Frequent']
 
+# Numeric columns the scaler/model were actually fit on (raw + engineered).
+# Must match the order used in src/prepare_and_save_data.
+num_cols_with_ratio = num_cols + ['Debt_to_Income_Ratio']
+
 ranges = {
     'Age': (18, 100),
     'Total_BNPL_Active_Loans': (0, 10),
@@ -59,16 +63,16 @@ for path in [model_path, scaler_path, cat_encoder_path]:
         print("Please ensure the training script has been run and saved the artifacts.")
         sys.exit(1)
     else:
-        print(f"✅ Found: {path} (size: {os.path.getsize(path) / 1024:.1f} KB)")
+        print(f"Found: {path} (size: {os.path.getsize(path) / 1024:.1f} KB)")
 
 print("All artifacts found. Loading...")
 try:
     model, scaler, cat_mappings = load_inference_components(
         model_path, scaler_path, cat_encoder_path
     )
-    print("✅ Model, scaler, and encoders loaded successfully.")
+    print("Model, scaler, and encoders loaded successfully.")
 except Exception as e:
-    print(f"❌ Error loading components: {e}")
+    print(f"Error loading components: {e}")
     import traceback
     traceback.print_exc()
     sys.exit(1)
@@ -91,14 +95,40 @@ for col in cat_cols:
 # 2. FUNCTIONS FOR BATCH (CSV) AND INTERACTIVE INPUT
 # ============================================================
 def process_single_input(input_dict):
-    """Process a single dictionary of inputs."""
-    # Validate numeric ranges (optional extra check)
+    """Process a single dictionary of inputs.
+
+    Adds the engineered Debt_to_Income_Ratio, validates numeric ranges
+    (only for the raw columns), and runs the full preprocessing + prediction
+    pipeline matching training.
+    """
+    # Work on a copy so we don't mutate the caller's dict
+    input_dict = dict(input_dict)
+
+    # --- Engineered feature (must match training formula) ---
+    income = float(input_dict['Income_USD'])
+    debt = float(input_dict['Total_BNPL_Debt_USD'])
+    input_dict['Debt_to_Income_Ratio'] = debt / income if income != 0 else 0.0
+
+    # --- Range validation (raw numeric columns only) ---
     for col in num_cols:
         low, high = ranges[col]
         val = input_dict[col]
         if val < low or val > high:
             print(f"Warning: {col} = {val} is outside typical range [{low}, {high}]")
-    X_num, X_cat = preprocess_single_sample(input_dict, num_cols, cat_cols, scaler, cat_mappings)
+
+    # --- Guard against column-order drift ---
+    if hasattr(scaler, "feature_names_in_"):
+        expected = list(scaler.feature_names_in_)
+        if expected != num_cols_with_ratio:
+            raise ValueError(
+                f"Column mismatch between scaler and inference script:\n"
+                f"  scaler fit on : {expected}\n"
+                f"  script passing: {num_cols_with_ratio}"
+            )
+
+    X_num, X_cat = preprocess_single_sample(
+        input_dict, num_cols_with_ratio, cat_cols, scaler, cat_mappings
+    )
     pred_class, probs = predict_single(model, X_num, X_cat, device)
     return pred_class, probs
 
@@ -204,7 +234,7 @@ def batch_inference(csv_path):
     # Save
     output_path = csv_path.replace('.csv', '_with_predictions.csv')
     df.to_csv(output_path, index=False)
-    print(f"✅ Predictions saved to: {output_path}")
+    print(f"Predictions saved to: {output_path}")
     print("\nPreview of predictions:")
     print(df[['Predicted_Risk'] + [f'Prob_{c}' for c in target_names]].head())
 
