@@ -1,3 +1,7 @@
+# BNPL Default Risk Assessment
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 # BNPL Default Risk Prediction
 
 End‑to‑end ML pipeline to classify BNPL customers into Low/Medium/High default risk.
