@@ -21,3 +21,8 @@ End‑to‑end ML pipeline to classify BNPL customers into Low/Medium/High defau
 ```bash
 pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
+```
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
