@@ -1,160 +1,99 @@
-# src/train.py
-import os
-import sys
+import json
+import random
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
-from sklearn.metrics import classification_report
 
-sys.path.append(os.path.dirname(__file__))
-from utils import *
+from config import (
+    BATCH_SIZE, DATA_PATH, DROPOUT, EMB_DIM, EPOCHS, HIDDEN_DIMS,
+    LEARNING_RATE, MODEL_CONFIG_PATH, MODEL_PATH, PATIENCE, RANDOM_STATE,
+    WEIGHT_DECAY,
+)
+from utils import (
+    EmbeddingNet, TabularDataset, encode_target, evaluate_model,
+    load_processed_data, train_model,
+)
 
-# ============================================================
-# 0. CONFIGURATION AND WORKING DIRECTORY
-# ============================================================
-print("="*60)
-print("TRAINING SCRIPT – BNPL Default Risk")
-print("="*60)
-print(f"Working directory: {os.getcwd()}")
 
-# If running from inside src/, go up one level to project root
-if os.path.basename(os.getcwd()) == 'src':
-    os.chdir('..')
-    print("Changed working directory to project root:", os.getcwd())
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-# Verify cache exists
-cache_path = 'data/processed/final_data.npz'
-if not os.path.exists(cache_path):
-    raise FileNotFoundError(
-        f"Cache not found at {cache_path}.\n"
-        "Please run src/data_preparation.py first."
+
+def main():
+    set_seed(RANDOM_STATE)
+
+    if not DATA_PATH.exists():
+        raise FileNotFoundError(
+            f"Processed data not found at {DATA_PATH}. "
+            "Run src/data_preparation.py first."
+        )
+
+    data = load_processed_data(DATA_PATH)
+    X_train, X_val, X_test = data["X_train"], data["X_val"], data["X_test"]
+    cat_train, cat_val, cat_test = data["cat_train"], data["cat_val"], data["cat_test"]
+    y_train = encode_target(data["y_train"])
+    y_val = encode_target(data["y_val"])
+    y_test = encode_target(data["y_test"])
+    cat_cardinalities = data["cat_cardinalities"]
+
+    train_loader = DataLoader(
+        TabularDataset(X_train, cat_train, y_train),
+        batch_size=BATCH_SIZE, shuffle=True,
     )
-print("Cache found. Proceeding.\n")
+    val_loader = DataLoader(
+        TabularDataset(X_val, cat_val, y_val),
+        batch_size=BATCH_SIZE, shuffle=False,
+    )
+    test_loader = DataLoader(
+        TabularDataset(X_test, cat_test, y_test),
+        batch_size=BATCH_SIZE, shuffle=False,
+    )
 
-# ============================================================
-# 1. LOAD DATA
-# ============================================================
-print("="*60)
-print("STEP 1: Loading processed data from cache")
-print("="*60)
-data = load_processed_data()   # uses default path, which now resolves correctly
-X_train, X_test = data['X_train'], data['X_test']
-cat_train, cat_test = data['cat_train'], data['cat_test']
-y_train = data['y_train']          # original string labels
-y_test = data['y_test']
-y_train_enc = encode_target(y_train)
-y_test_enc = encode_target(y_test)
-cat_cardinalities = data['cat_cardinalities']
-target_names = ['Low', 'Medium', 'High']
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-print(f"X_train shape: {X_train.shape}")
-print(f"X_test shape:  {X_test.shape}")
-print(f"cat_train shape: {cat_train.shape}")
-print(f"cat_test shape:  {cat_test.shape}")
-print(f"y_train_enc shape: {y_train_enc.shape}")
-print(f"y_test_enc shape:  {y_test_enc.shape}")
-print("Sample y_train_enc[:10]:", y_train_enc[:10])
-print()
+    model = EmbeddingNet(
+        num_numeric=X_train.shape[1],
+        cat_cardinalities=cat_cardinalities,
+    )
 
-# ============================================================
-# 2. XGBOOST BASELINE
-# ============================================================
-print("="*60)
-print("STEP 2: XGBoost Baseline")
-print("="*60)
-xgb_model = train_xgboost(X_train, y_train_enc, X_test, y_test_enc)
-y_pred_xgb = xgb_model.predict(X_test)
+    class_counts = np.bincount(y_train, minlength=3)
+    class_weights = torch.tensor(1.0 / (class_counts + 1e-6), dtype=torch.float32)
+    class_weights = class_weights / class_weights.sum() * 3
 
-print("\nXGBoost Performance on Test Set:")
-print(classification_report(y_test_enc, y_pred_xgb, target_names=target_names, digits=4))
-xgb_report = classification_report(y_test_enc, y_pred_xgb,
-                                   target_names=target_names,
-                                   digits=4, output_dict=True)
-xgb_f1 = xgb_report['macro avg']['f1-score']
-print(f"XGBoost Macro F1: {xgb_f1:.4f}\n")
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE,
+                           weight_decay=WEIGHT_DECAY)
+    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
 
-# ============================================================
-# 3. PYTORCH SETUP
-# ============================================================
-print("="*60)
-print("STEP 3: PyTorch Setup (DataLoaders, Model, Optimizer)")
-print("="*60)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+    model, train_losses, val_losses, val_f1s = train_model(
+        model, train_loader, val_loader, criterion, optimizer, scheduler,
+        device, epochs=EPOCHS, patience=PATIENCE,
+    )
 
-batch_size = 256
-train_ds = TabularDataset(X_train, cat_train, y_train_enc)
-test_ds  = TabularDataset(X_test,  cat_test,  y_test_enc)
-train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), MODEL_PATH)
 
-model = EmbeddingNet(num_numeric=X_train.shape[1],
-                     cat_cardinalities=cat_cardinalities)
-print(f"Model architecture:\n{model}")
-print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    model_config = {
+        "num_numeric": int(X_train.shape[1]),
+        "cat_cardinalities": [int(c) for c in cat_cardinalities],
+        "emb_dim": EMB_DIM,
+        "hidden_dims": HIDDEN_DIMS,
+        "dropout": DROPOUT,
+    }
+    with open(MODEL_CONFIG_PATH, "w") as f:
+        json.dump(model_config, f, indent=2)
 
-# Class weights for CrossEntropy
-class_counts = np.bincount(y_train_enc)
-class_weights = torch.tensor([1.0 / c for c in class_counts], dtype=torch.float32)
-class_weights = class_weights / class_weights.sum() * 3
-print(f"Class weights (normalised): {class_weights}")
+    report, macro_f1, _, _ = evaluate_model(model, test_loader, device)
+    print(f"Test Macro F1: {macro_f1:.4f}")
 
-criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
-optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-print("Optimizer, criterion, scheduler initialised.\n")
 
-# ============================================================
-# 4. TRAIN PYTORCH MODEL
-# ============================================================
-print("="*60)
-print("STEP 4: PyTorch Training Loop (with early stopping)")
-print("="*60)
-model, train_losses, val_losses, val_f1s = train_model(
-    model, train_loader, test_loader, criterion, optimizer, scheduler,
-    device, epochs=200, patience=15
-)
-
-# ============================================================
-# 5. SAVE BEST MODEL
-# ============================================================
-print("\n" + "="*60)
-print("STEP 5: Saving best model")
-print("="*60)
-os.makedirs('models', exist_ok=True)
-model_path = 'models/best_pytorch_model.pth'
-torch.save(model.state_dict(), model_path)
-print(f"Model saved to {model_path}")
-if os.path.exists(model_path):
-    print(f"File size: {os.path.getsize(model_path) / 1024:.1f} KB")
-else:
-    print("ERROR: Model file not saved.")
-print()
-
-# ============================================================
-# 6. FINAL EVALUATION ON TEST SET
-# ============================================================
-print("="*60)
-print("STEP 6: PyTorch Final Evaluation on Test Set")
-print("="*60)
-pytorch_report, pytorch_f1, preds, targets = evaluate_model(
-    model, test_loader, device, target_names
-)
-print("\nPyTorch Performance on Test Set:")
-print(classification_report(targets, preds, target_names=target_names, digits=4))
-print(f"PyTorch Macro F1: {pytorch_f1:.4f}\n")
-
-# ============================================================
-# 7. FINAL COMPARISON
-# ============================================================
-print("="*60)
-print("STEP 7: Final Comparison")
-print("="*60)
-print(f"XGBoost  Macro F1: {xgb_f1:.4f}")
-print(f"PyTorch  Macro F1: {pytorch_f1:.4f}")
-print(f"Improvement:       {pytorch_f1 - xgb_f1:+.4f}")
-print("="*60)
-print("Training script completed.")
+if __name__ == "__main__":
+    main()
